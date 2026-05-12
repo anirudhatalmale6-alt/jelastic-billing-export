@@ -2,8 +2,9 @@
 """
 Jelastic Billing Export
 -----------------------
-Pulls billing data from a Jelastic/Virtuozzo cloud platform,
-writes CSV files, and uploads them via SFTP (or FTP).
+Pulls billing data from a Jelastic/Virtuozzo cloud platform using the
+native CSV export API (same format as the SaveInCloud portal), then
+uploads the files via SFTP or FTP.
 
 Designed to run headless on a Linux VM via cron or systemd timer.
 All configuration lives in config.yaml (or environment variables).
@@ -28,7 +29,7 @@ try:
 except ImportError:
     HAS_PARAMIKO = False
 
-# Maximum date range the API allows per period granularity
+# API interval limits per period granularity
 PERIOD_MAX_DAYS = {
     "HOUR": 1,
     "DAY": 7,
@@ -143,10 +144,7 @@ def compute_date_range(cfg):
 
 
 def chunk_date_range(start_dt, end_dt, period):
-    """
-    Split a date range into chunks that respect the API's interval limits.
-    HOUR: max 1 day, DAY: max 7 days, MONTH: max 365 days.
-    """
+    """Split a date range into chunks that respect API interval limits."""
     max_days = PERIOD_MAX_DAYS.get(period, 7)
     chunks = []
     current = start_dt
@@ -162,29 +160,25 @@ def chunk_date_range(start_dt, end_dt, period):
 # ---------------------------------------------------------------------------
 
 class JelasticClient:
-    """Thin wrapper around the Jelastic REST API."""
+    """Wrapper around the Jelastic REST API with native CSV export."""
 
     def __init__(self, api_url, token, logger):
         self.api_url = api_url.rstrip("/") + "/"
         self.token = token
         self.logger = logger
         self.session = requests.Session()
-        self.session.headers.update({"Accept": "application/json"})
 
     def _call(self, endpoint, params=None):
         url = f"{self.api_url}{endpoint}"
         if params is None:
             params = {}
         params["session"] = self.token
-
         self.logger.debug(f"API call: {endpoint}")
         resp = self.session.get(url, params=params, timeout=60)
         resp.raise_for_status()
         data = resp.json()
-
         if data.get("result") != 0:
-            error_msg = data.get("error", "Unknown error")
-            self.logger.debug(f"API non-zero result on {endpoint}: {error_msg}")
+            self.logger.debug(f"API error on {endpoint}: {data.get('error')}")
             return None
         return data
 
@@ -193,150 +187,95 @@ class JelasticClient:
         data = self._call("environment/control/rest/getenvs")
         if data is None:
             return []
-        infos = data.get("infos", [])
         envs = []
-        for info in infos:
+        for info in data.get("infos", []):
             env = info.get("env", {})
-            nodes = info.get("nodes", [])
-            node_details = []
-            for n in nodes:
-                node_details.append({
-                    "nodeId": n.get("id", ""),
-                    "nodeType": n.get("nodeType", ""),
-                    "name": n.get("name", ""),
-                    "fixedCloudlets": n.get("fixedCloudlets", 0),
-                    "flexibleCloudlets": n.get("flexibleCloudlets", 0),
-                })
             envs.append({
                 "envName": env.get("envName", ""),
                 "appid": env.get("appid", ""),
                 "domain": env.get("domain", ""),
                 "status": env.get("status", 0),
-                "nodes": node_details,
             })
         self.logger.info(f"Found {len(envs)} environment(s)")
         return envs
 
-    def get_billing_for_env(self, env_name, start_dt, end_dt, period="DAY",
-                            group_nodes=True):
+    def export_billing_csv(self, start_dt, end_dt, period="DAY",
+                           group_nodes=False, env_name=None):
         """
-        Fetch billing history for a specific environment using envName.
-        Automatically chunks requests to respect API interval limits.
+        Use the native ExportAccountBillingHistoryByPeriod endpoint to
+        get a CSV download link, then download the CSV content.
+        Returns the CSV text (including headers).
+
+        Automatically chunks large date ranges and merges the results.
         """
         chunks = chunk_date_range(start_dt, end_dt, period)
-        all_items = []
+        all_lines = []
+        header_line = None
 
-        for chunk_start, chunk_end in chunks:
-            start_str = chunk_start.strftime("%Y-%m-%d %H:%M:%S")
-            end_str = chunk_end.strftime("%Y-%m-%d %H:%M:%S")
-
+        for i, (chunk_start, chunk_end) in enumerate(chunks):
             params = {
-                "startTime": start_str,
-                "endTime": end_str,
+                "startTime": chunk_start.strftime("%Y-%m-%d %H:%M:%S"),
+                "endTime": chunk_end.strftime("%Y-%m-%d %H:%M:%S"),
                 "period": period,
-                "envName": env_name,
                 "groupNodes": str(group_nodes).lower(),
             }
+            if env_name:
+                params["envName"] = env_name
 
             data = self._call(
-                "billing/account/rest/getaccountbillinghistorybyperiod",
+                "billing/account/rest/exportaccountbillinghistorybyperiod",
                 params
             )
-            if data is not None:
-                items = data.get("array", [])
-                for item in items:
-                    if not item.get("envName"):
-                        item["envName"] = env_name
-                all_items.extend(items)
-                self.logger.debug(
-                    f"  Chunk {start_str} to {end_str}: {len(items)} records"
+            if data is None:
+                self.logger.warning(
+                    f"Export failed for chunk {chunk_start} to {chunk_end}"
                 )
+                continue
 
-        self.logger.info(
-            f"  {env_name}: {len(all_items)} billing records fetched"
-        )
-        return all_items
+            download_link = data.get("link", "")
+            if not download_link:
+                self.logger.warning("No download link in API response")
+                continue
 
-    def get_billing_all(self, start_dt, end_dt, period="DAY", group_nodes=True):
-        """Fetch billing for all environments combined."""
-        chunks = chunk_date_range(start_dt, end_dt, period)
-        all_items = []
+            self.logger.debug(f"Downloading CSV from: {download_link}")
+            resp = self.session.get(download_link, timeout=120)
+            resp.raise_for_status()
 
-        for chunk_start, chunk_end in chunks:
-            start_str = chunk_start.strftime("%Y-%m-%d %H:%M:%S")
-            end_str = chunk_end.strftime("%Y-%m-%d %H:%M:%S")
+            csv_text = resp.text.strip()
+            if not csv_text:
+                self.logger.debug(f"  Chunk {i+1}/{len(chunks)}: empty CSV")
+                continue
 
-            params = {
-                "startTime": start_str,
-                "endTime": end_str,
-                "period": period,
-                "groupNodes": str(group_nodes).lower(),
-            }
+            lines = csv_text.split("\n")
 
-            data = self._call(
-                "billing/account/rest/getaccountbillinghistorybyperiod",
-                params
+            if header_line is None and lines:
+                header_line = lines[0]
+
+            # Add data rows (skip header on subsequent chunks)
+            data_lines = lines[1:] if i > 0 or header_line else lines
+            if i == 0:
+                data_lines = lines[1:]
+
+            data_rows = [l for l in data_lines if l.strip()]
+            all_lines.extend(data_rows)
+            self.logger.debug(
+                f"  Chunk {i+1}/{len(chunks)}: {len(data_rows)} data rows"
             )
-            if data is not None:
-                all_items.extend(data.get("array", []))
 
-        self.logger.info(f"Total billing records fetched: {len(all_items)}")
-        return all_items
+        if header_line:
+            total_rows = len(all_lines)
+            self.logger.info(f"CSV export: {total_rows} billing rows fetched")
+            return header_line + "\n" + "\n".join(all_lines) if all_lines else header_line + "\n"
+        elif all_lines:
+            return "\n".join(all_lines)
+        else:
+            self.logger.warning("No billing data in export")
+            return None
 
 
 # ---------------------------------------------------------------------------
-# CSV export
+# File operations
 # ---------------------------------------------------------------------------
-
-CSV_HEADERS = [
-    "envName",
-    "date",
-    "resourceName",
-    "cost",
-    "nodeType",
-    "nodeGroup",
-    "note",
-]
-
-
-def format_row(item, all_keys):
-    """Normalize a billing API item into a flat dict for CSV output."""
-    row = {}
-    for key in all_keys:
-        val = item.get(key, "")
-        if key == "cost" and val != "":
-            try:
-                val = f"{float(val):.6f}"
-            except (ValueError, TypeError):
-                pass
-        row[key] = val
-    return row
-
-
-def write_csv(data, filepath, logger):
-    """Write billing data to a CSV file."""
-    out_dir = Path(filepath).parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    if not data:
-        logger.warning(f"No billing data to write for {filepath}")
-        return False
-
-    all_keys = list(CSV_HEADERS)
-    for item in data:
-        for k in item:
-            if k not in all_keys:
-                all_keys.append(k)
-
-    with open(filepath, mode="w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=all_keys, extrasaction="ignore")
-        writer.writeheader()
-        for item in data:
-            writer.writerow(format_row(item, all_keys))
-
-    logger.info(f"CSV written: {filepath} ({len(data)} rows)")
-    return True
-
 
 def build_filename(pattern, env_name="", start_dt=None, end_dt=None):
     """Replace placeholders in the filename pattern."""
@@ -352,6 +291,19 @@ def build_filename(pattern, env_name="", start_dt=None, end_dt=None):
     for placeholder, value in replacements.items():
         result = result.replace(placeholder, value)
     return result
+
+
+def save_csv(csv_text, filepath, logger):
+    """Save CSV text to a file."""
+    out_dir = Path(filepath).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(csv_text)
+
+    line_count = csv_text.count("\n")
+    logger.info(f"CSV saved: {filepath} ({line_count} lines)")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -414,11 +366,11 @@ def upload_via_sftp(filepath, cfg, logger):
         sftp.close()
         ssh.close()
 
-        logger.info(f"SFTP upload successful: {filename} -> {remote_path}")
+        logger.info(f"SFTP upload OK: {filename} -> {remote_path}")
 
         if sftp_cfg.get("delete_after_upload", False):
             Path(filepath).unlink()
-            logger.info(f"Local file deleted after upload: {filepath}")
+            logger.info(f"Local file deleted: {filepath}")
 
         return True
 
@@ -467,7 +419,7 @@ def upload_via_ftp(filepath, cfg, logger):
             ftp.storbinary(f"STOR {filename}", f)
 
         ftp.quit()
-        logger.info(f"FTP upload successful: {filename} -> {remote_dir}")
+        logger.info(f"FTP upload OK: {filename} -> {remote_dir}")
 
         if ftp_cfg.get("delete_after_upload", False):
             Path(filepath).unlink()
@@ -498,7 +450,7 @@ def upload_file(filepath, cfg, logger):
 # ---------------------------------------------------------------------------
 
 def run(config_path="config.yaml"):
-    """Main entry point: fetch billing, write CSVs, upload."""
+    """Main entry point: export billing CSV and upload."""
     cfg = load_config(config_path)
     logger = setup_logging(cfg)
 
@@ -526,12 +478,12 @@ def run(config_path="config.yaml"):
     billing_cfg = cfg.get("billing", {})
     csv_cfg = cfg.get("csv", {})
     period = billing_cfg.get("period", "DAY")
-    group_nodes = billing_cfg.get("group_nodes", True)
+    group_nodes = billing_cfg.get("group_nodes", False)
     output_dir = csv_cfg.get("output_dir", "./output")
     pattern = csv_cfg.get("filename_pattern", "billing_{date}.csv")
     per_env = csv_cfg.get("per_environment", False)
 
-    # Always list environments to know what we're working with
+    # List environments
     envs = client.get_environments()
     if not envs:
         logger.error("No environments found. Check your token and API URL.")
@@ -546,43 +498,53 @@ def run(config_path="config.yaml"):
     files_written = []
 
     if per_env:
+        # One CSV per environment
         for env in envs:
             env_name = env["envName"]
-            logger.info(f"Fetching billing for: {env_name}")
+            logger.info(f"Exporting billing for: {env_name}")
 
-            data = client.get_billing_for_env(
-                env_name, start_dt, end_dt,
-                period=period, group_nodes=group_nodes,
+            csv_text = client.export_billing_csv(
+                start_dt, end_dt,
+                period=period,
+                group_nodes=group_nodes,
+                env_name=env_name,
             )
 
-            filename = build_filename(
-                pattern, env_name=env_name,
-                start_dt=start_dt, end_dt=end_dt
-            )
-            if "{env}" not in csv_cfg.get("filename_pattern", ""):
-                stem = Path(filename).stem
-                ext = Path(filename).suffix
-                filename = f"{stem}_{env_name}{ext}"
+            if csv_text:
+                filename = build_filename(
+                    pattern, env_name=env_name,
+                    start_dt=start_dt, end_dt=end_dt
+                )
+                if "{env}" not in csv_cfg.get("filename_pattern", ""):
+                    stem = Path(filename).stem
+                    ext = Path(filename).suffix
+                    filename = f"{stem}_{env_name}{ext}"
 
-            filepath = Path(output_dir) / filename
-            if write_csv(data, str(filepath), logger):
-                files_written.append(str(filepath))
+                filepath = str(Path(output_dir) / filename)
+                if save_csv(csv_text, filepath, logger):
+                    files_written.append(filepath)
     else:
-        logger.info("Fetching billing for all environments (combined)")
-        all_data = []
-        for env in envs:
-            env_name = env["envName"]
-            data = client.get_billing_for_env(
-                env_name, start_dt, end_dt,
-                period=period, group_nodes=group_nodes,
+        # All environments in one CSV
+        logger.info("Exporting billing for all environments")
+        csv_text = client.export_billing_csv(
+            start_dt, end_dt,
+            period=period,
+            group_nodes=group_nodes,
+        )
+
+        if csv_text:
+            filename = build_filename(
+                pattern, start_dt=start_dt, end_dt=end_dt
             )
-            all_data.extend(data)
+            filepath = str(Path(output_dir) / filename)
+            if save_csv(csv_text, filepath, logger):
+                files_written.append(filepath)
 
-        filename = build_filename(pattern, start_dt=start_dt, end_dt=end_dt)
-        filepath = Path(output_dir) / filename
-
-        if write_csv(all_data, str(filepath), logger):
-            files_written.append(str(filepath))
+    if not files_written:
+        logger.warning(
+            "No CSV files generated. "
+            "The account may have no billing data for this period."
+        )
 
     # Upload files
     upload_count = 0
@@ -605,7 +567,7 @@ def run(config_path="config.yaml"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Jelastic Billing Export - Fetch billing data and upload"
+        description="Jelastic Billing Export - Export billing CSV and upload"
     )
     parser.add_argument(
         "-c", "--config",
