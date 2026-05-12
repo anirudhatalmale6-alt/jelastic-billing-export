@@ -1,0 +1,68 @@
+# =============================================================
+# Jelastic Billing Export - Configuration
+# =============================================================
+# All settings can be changed here without modifying the script.
+# For security, you can also use environment variables:
+#   JELASTIC_API_URL, JELASTIC_TOKEN, FTP_HOST, FTP_USER, FTP_PASS
+# Environment variables take priority over values in this file.
+# =============================================================
+
+# --- Jelastic API Settings ---
+jelastic:
+  # Your provider's API URL (SaveInCloud example shown)
+  api_url: "https://app.saveincloud.com/1.0/"
+  # API token generated in your Jelastic dashboard (Settings > API Tokens)
+  token: "YOUR_TOKEN_HERE"
+
+# --- Billing Query Settings ---
+billing:
+  # How far back to pull data: "7d" (7 days), "30d" (30 days), "1m" (1 month)
+  # Or use fixed dates: start_date / end_date below
+  lookback: "7d"
+  # Fixed date range (overrides lookback if both start_date and end_date are set)
+  # Format: YYYY-MM-DD HH:MM:SS
+  start_date: ""
+  end_date: ""
+  # Granularity: HOUR, DAY, MONTH, YEAR
+  period: "DAY"
+  # Group nodes in the same environment together (true/false)
+  group_nodes: true
+
+# --- CSV Output Settings ---
+csv:
+  # Output directory for CSV files (relative to script or absolute path)
+  output_dir: "./output"
+  # File name pattern. Available placeholders:
+  #   {date}     = current date (YYYY-MM-DD)
+  #   {datetime} = current datetime (YYYY-MM-DD_HHMMSS)
+  #   {env}      = environment name (used when per_environment is true)
+  #   {start}    = billing start date
+  #   {end}      = billing end date
+  filename_pattern: "billing_{date}.csv"
+  # Generate one CSV per environment (true) or one combined CSV (false)
+  per_environment: false
+
+# --- FTP Upload Settings ---
+ftp:
+  enabled: true
+  host: "YOUR_FTP_HOST"
+  port: 21
+  username: "YOUR_FTP_USER"
+  password: "YOUR_FTP_PASS"
+  # Use TLS/SSL (recommended)
+  use_tls: true
+  # Remote directory on FTP server
+  remote_dir: "/billing-exports/"
+  # Delete local CSV after successful upload (true/false)
+  delete_after_upload: false
+
+# --- Logging Settings ---
+logging:
+  # Log file path (relative or absolute)
+  log_file: "./logs/billing_export.log"
+  # Log level: DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
+  # Maximum log file size in MB before rotation
+  max_size_mb: 5
+  # Number of backup log files to keep
+  backup_count: 3
