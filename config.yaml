@@ -3,14 +3,15 @@
 # =============================================================
 # All settings can be changed here without modifying the script.
 # For security, you can also use environment variables:
-#   JELASTIC_API_URL, JELASTIC_TOKEN, FTP_HOST, FTP_USER, FTP_PASS
+#   JELASTIC_API_URL, JELASTIC_TOKEN, SFTP_HOST, SFTP_USER, SFTP_PASS
 # Environment variables take priority over values in this file.
 # =============================================================
 
 # --- Jelastic API Settings ---
 jelastic:
-  # Your provider's API URL (SaveInCloud example shown)
-  api_url: "https://app.saveincloud.com/1.0/"
+  # Your provider's API URL
+  # SaveInCloud: https://app.paas.saveincloud.net.br/1.0/
+  api_url: "https://app.paas.saveincloud.net.br/1.0/"
   # API token generated in your Jelastic dashboard (Settings > API Tokens)
   token: "YOUR_TOKEN_HERE"
 
@@ -24,6 +25,8 @@ billing:
   start_date: ""
   end_date: ""
   # Granularity: HOUR, DAY, MONTH, YEAR
+  # Note: API limits per period - HOUR: max 1 day, DAY: max 7 days
+  # The script automatically splits larger ranges into valid chunks.
   period: "DAY"
   # Group nodes in the same environment together (true/false)
   group_nodes: true
@@ -42,9 +45,23 @@ csv:
   # Generate one CSV per environment (true) or one combined CSV (false)
   per_environment: false
 
-# --- FTP Upload Settings ---
-ftp:
+# --- SFTP Upload Settings (SSH-based) ---
+sftp:
   enabled: true
+  host: "YOUR_SFTP_HOST"
+  port: 22
+  username: "YOUR_SFTP_USER"
+  password: "YOUR_SFTP_PASS"
+  # SSH private key file (optional, overrides password if set)
+  key_file: ""
+  # Remote directory on SFTP server
+  remote_dir: "/home/arthur/"
+  # Delete local CSV after successful upload (true/false)
+  delete_after_upload: false
+
+# --- FTP Upload Settings (alternative to SFTP) ---
+ftp:
+  enabled: false
   host: "YOUR_FTP_HOST"
   port: 21
   username: "YOUR_FTP_USER"
